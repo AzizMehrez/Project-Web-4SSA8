@@ -1,0 +1,362 @@
+# ShopyTn — local infrastructure (intermediate validation architecture)
+# Network: marketplace-net
+# Documented startup order: Eureka → Config → Keycloak/RabbitMQ/DBs → microservices → Gateway
+#
+# Usage:
+#   docker compose up -d
+#   docker compose down
+#
+# Spring Boot services (api-gateway, discovery-server, *-service) are prepared
+# as build placeholders. Enable them with:
+#   docker compose --profile apps up -d
+# after each Backend/*/Dockerfile exists.
+
+name: shoptyn
+
+services:
+  # ---------------------------------------------------------------------------
+  # Databases
+  # ---------------------------------------------------------------------------
+  mysql:
+    image: mysql:8.4
+    container_name: shoptyn-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root}
+      MYSQL_USER: ${MYSQL_USER:-shopytn}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-shopytn}
+      MYSQL_DATABASE: user_db
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./docker/mysql/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    networks:
+      - marketplace-net
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p${MYSQL_ROOT_PASSWORD:-root}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  postgres-catalog:
+    image: postgres:16
+    container_name: shoptyn-postgres-catalog
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: catalog_db
+      POSTGRES_USER: ${POSTGRES_CATALOG_USER:-shopytn}
+      POSTGRES_PASSWORD: ${POSTGRES_CATALOG_PASSWORD:-shopytn}
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_catalog_data:/var/lib/postgresql/data
+    networks:
+      - marketplace-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  postgres-keycloak:
+    image: postgres:16
+    container_name: shoptyn-postgres-keycloak
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: keycloak_db
+      POSTGRES_USER: ${POSTGRES_KEYCLOAK_USER:-keycloak}
+      POSTGRES_PASSWORD: ${POSTGRES_KEYCLOAK_PASSWORD:-keycloak}
+    ports:
+      - "5434:5432"
+    volumes:
+      - postgres_keycloak_data:/var/lib/postgresql/data
+    networks:
+      - marketplace-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  # ---------------------------------------------------------------------------
+  # Messaging
+  # ---------------------------------------------------------------------------
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    container_name: shoptyn-rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-shopytn}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-shopytn}
+    ports:
+      - "5672:5672"     # AMQP
+      - "15672:15672"   # Management UI
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    networks:
+      - marketplace-net
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # Identity (Keycloak :8180 — realm marketplace to be imported later)
+  # ---------------------------------------------------------------------------
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    container_name: shoptyn-keycloak
+    restart: unless-stopped
+    command: ["start-dev"]
+    environment:
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres-keycloak:5432/keycloak_db
+      KC_DB_USERNAME: ${POSTGRES_KEYCLOAK_USER:-keycloak}
+      KC_DB_PASSWORD: ${POSTGRES_KEYCLOAK_PASSWORD:-keycloak}
+      KC_HTTP_PORT: 8180
+      KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN:-admin}
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+    ports:
+      - "8180:8180"
+    depends_on:
+      postgres-keycloak:
+        condition: service_healthy
+    networks:
+      - marketplace-net
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/8180"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+
+  # ---------------------------------------------------------------------------
+  # Spring Cloud infrastructure (requires Backend Dockerfiles)
+  # ---------------------------------------------------------------------------
+  discovery-server:
+    profiles: ["apps"]
+    build:
+      context: ./Backend/discovery-server
+    container_name: shoptyn-eureka
+    restart: unless-stopped
+    ports:
+      - "8761:8761"
+    networks:
+      - marketplace-net
+
+  config-server:
+    profiles: ["apps"]
+    build:
+      context: ./Backend/config-server
+    container_name: shoptyn-config
+    restart: unless-stopped
+    ports:
+      - "8888:8888"
+    depends_on:
+      - discovery-server
+    networks:
+      - marketplace-net
+
+  api-gateway:
+    profiles: ["apps"]
+    build:
+      context: ./Backend/api-gateway
+    container_name: shoptyn-gateway
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    depends_on:
+      - discovery-server
+      - keycloak
+    networks:
+      - marketplace-net
+
+  # ---------------------------------------------------------------------------
+  # Business microservices (requires Backend/*/Dockerfile)
+  # ---------------------------------------------------------------------------
+  user-service:
+    profiles: ["apps"]
+    build:
+      context: ./Backend/user-service
+    container_name: shoptyn-user
+    restart: unless-stopped
+    ports:
+      - "8081:8081"
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/user_db
+      SPRING_DATASOURCE_USERNAME: ${MYSQL_USER:-shopytn}
+      SPRING_DATASOURCE_PASSWORD: ${MYSQL_PASSWORD:-shopytn}
+      SPRING_RABBITMQ_HOST: rabbitmq
+      EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://discovery-server:8761/eureka/
+    depends_on:
+      mysql:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      discovery-server:
+        condition: service_started
+      keycloak:
+        condition: service_started
+    networks:
+      - marketplace-net
+
+  catalog-service:
+    profiles: ["apps"]
+    build:
+      context: ./Backend/catalog-service
+    container_name: shoptyn-catalog
+    restart: unless-stopped
+    ports:
+      - "8082:8082"
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres-catalog:5432/catalog_db
+      SPRING_DATASOURCE_USERNAME: ${POSTGRES_CATALOG_USER:-shopytn}
+      SPRING_DATASOURCE_PASSWORD: ${POSTGRES_CATALOG_PASSWORD:-shopytn}
+      SPRING_RABBITMQ_HOST: rabbitmq
+      EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://discovery-server:8761/eureka/
+    depends_on:
+      postgres-catalog:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      discovery-server:
+        condition: service_started
+    networks:
+      - marketplace-net
+
+  order-service:
+    profiles: ["apps"]
+    build:
+      context: ./Backend/order-service
+    container_name: shoptyn-order
+    restart: unless-stopped
+    ports:
+      - "8083:8083"
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/order_db
+      SPRING_DATASOURCE_USERNAME: ${MYSQL_USER:-shopytn}
+      SPRING_DATASOURCE_PASSWORD: ${MYSQL_PASSWORD:-shopytn}
+      SPRING_RABBITMQ_HOST: rabbitmq
+      EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://discovery-server:8761/eureka/
+    depends_on:
+      mysql:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      discovery-server:
+        condition: service_started
+    networks:
+      - marketplace-net
+
+  payment-service:
+    profiles: ["apps"]
+    build:
+      context: ./Backend/payment-service
+    container_name: shoptyn-payment
+    restart: unless-stopped
+    ports:
+      - "8084:8084"
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/payment_db
+      SPRING_DATASOURCE_USERNAME: ${MYSQL_USER:-shopytn}
+      SPRING_DATASOURCE_PASSWORD: ${MYSQL_PASSWORD:-shopytn}
+      SPRING_RABBITMQ_HOST: rabbitmq
+      EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://discovery-server:8761/eureka/
+    depends_on:
+      mysql:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      discovery-server:
+        condition: service_started
+    networks:
+      - marketplace-net
+
+  delivery-service:
+    profiles: ["apps"]
+    build:
+      context: ./Backend/delivery-service
+    container_name: shoptyn-delivery
+    restart: unless-stopped
+    ports:
+      - "8085:8085"
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/delivery_db
+      SPRING_DATASOURCE_USERNAME: ${MYSQL_USER:-shopytn}
+      SPRING_DATASOURCE_PASSWORD: ${MYSQL_PASSWORD:-shopytn}
+      SPRING_RABBITMQ_HOST: rabbitmq
+      EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://discovery-server:8761/eureka/
+    depends_on:
+      mysql:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      discovery-server:
+        condition: service_started
+    networks:
+      - marketplace-net
+
+  dispute-service:
+    profiles: ["apps"]
+    build:
+      context: ./Backend/dispute-service
+    container_name: shoptyn-dispute
+    restart: unless-stopped
+    ports:
+      - "8086:8086"
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/dispute_db
+      SPRING_DATASOURCE_USERNAME: ${MYSQL_USER:-shopytn}
+      SPRING_DATASOURCE_PASSWORD: ${MYSQL_PASSWORD:-shopytn}
+      SPRING_RABBITMQ_HOST: rabbitmq
+      EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://discovery-server:8761/eureka/
+    depends_on:
+      mysql:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      discovery-server:
+        condition: service_started
+    networks:
+      - marketplace-net
+
+  notification-service:
+    profiles: ["apps"]
+    build:
+      context: ./Backend/notification-service
+    container_name: shoptyn-notification
+    restart: unless-stopped
+    ports:
+      - "8087:8087"
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/notification_db
+      SPRING_DATASOURCE_USERNAME: ${MYSQL_USER:-shopytn}
+      SPRING_DATASOURCE_PASSWORD: ${MYSQL_PASSWORD:-shopytn}
+      SPRING_RABBITMQ_HOST: rabbitmq
+      EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://discovery-server:8761/eureka/
+    depends_on:
+      mysql:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      discovery-server:
+        condition: service_started
+    networks:
+      - marketplace-net
+
+networks:
+  marketplace-net:
+    name: marketplace-net
+    driver: bridge
+
+volumes:
+  mysql_data:
+  postgres_catalog_data:
+  postgres_keycloak_data:
+  rabbitmq_data:
